@@ -2,70 +2,97 @@ import http from "http";
 import { WebSocketServer } from "ws";
 
 const server = http.createServer((req, res) => {
-  // simple health response (nice for platforms + debugging)
   res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("ok");
+  res.end("ok\n");
 });
 
 const wss = new WebSocketServer({ server });
 
-// roomId -> Set(ws)
+/** Map<roomId, Set<WebSocket>> */
 const rooms = new Map();
 
-function send(ws, obj) {
+function safeSend(ws, obj) {
   if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj));
 }
 
-function relay(roomId, from, msg) {
-  const peers = rooms.get(roomId);
-  if (!peers) return;
-  for (const p of peers) if (p !== from) send(p, msg);
+function peersOf(roomId) {
+  return rooms.get(roomId) || new Set();
+}
+
+function sendToOthers(roomId, fromWs, msgObj) {
+  for (const peer of peersOf(roomId)) {
+    if (peer !== fromWs) safeSend(peer, msgObj);
+  }
+}
+
+function sendToAll(roomId, msgObj) {
+  for (const peer of peersOf(roomId)) safeSend(peer, msgObj);
 }
 
 wss.on("connection", (ws) => {
   ws.roomId = null;
 
-  ws.on("message", (raw) => {
+  ws.on("message", (data) => {
     let msg;
-    try { msg = JSON.parse(raw.toString()); } catch { return; }
+    try { msg = JSON.parse(data.toString()); } catch { return; }
 
     if (msg.type === "join") {
-      const room = String(msg.room || "").trim();
-      if (!room) return;
+      const roomId = String(msg.room || "").trim();
+      if (!roomId) return;
 
-      ws.roomId = room;
-      if (!rooms.has(room)) rooms.set(room, new Set());
-      const peers = rooms.get(room);
+      // leave old room
+      if (ws.roomId) {
+        const old = rooms.get(ws.roomId);
+        if (old) {
+          old.delete(ws);
+          if (old.size === 0) rooms.delete(ws.roomId);
+          else sendToAll(ws.roomId, { type: "peer_left" });
+        }
+      }
 
-      if (peers.size >= 2) {
-        send(ws, { type: "room_full" });
+      ws.roomId = roomId;
+      if (!rooms.has(roomId)) rooms.set(roomId, new Set());
+      const room = rooms.get(roomId);
+
+      // 2 max
+      if (room.size >= 2) {
+        safeSend(ws, { type: "room_full" });
         ws.close();
         return;
       }
 
-      peers.add(ws);
-      const role = peers.size === 1 ? "caller" : "callee";
-      send(ws, { type: "joined", role, room });
-      relay(room, ws, { type: "peer_joined" });
+      room.add(ws);
+
+      const role = room.size === 1 ? "caller" : "callee";
+      safeSend(ws, { type: "joined", room: roomId, role });
+
+      // IMPORTANT: tell *everyone* in the room that a peer is present.
+      // This ensures both sides get a deterministic "peer_joined" signal.
+      if (room.size === 2) {
+        sendToAll(roomId, { type: "peer_joined" });
+      }
+
       return;
     }
 
+    // Relay signaling messages to the other peer
     if (ws.roomId && (msg.type === "offer" || msg.type === "answer" || msg.type === "ice")) {
-      relay(ws.roomId, ws, msg);
+      sendToOthers(ws.roomId, ws, msg);
+      return;
     }
   });
 
   ws.on("close", () => {
-    const room = ws.roomId;
+    if (!ws.roomId) return;
+    const roomId = ws.roomId;
+    const room = rooms.get(roomId);
     if (!room) return;
-    const peers = rooms.get(room);
-    if (!peers) return;
-    peers.delete(ws);
-    if (peers.size === 0) rooms.delete(room);
-    else for (const p of peers) send(p, { type: "peer_left" });
+
+    room.delete(ws);
+    if (room.size === 0) rooms.delete(roomId);
+    else sendToAll(roomId, { type: "peer_left" });
   });
 });
 
-// IMPORTANT: platforms provide PORT env var
 const PORT = process.env.PORT || 8080;
-server.listen(PORT, "0.0.0.0", () => console.log("Signaling server on", PORT));
+server.listen(PORT, () => console.log(`Signaling server on :${PORT}`));
